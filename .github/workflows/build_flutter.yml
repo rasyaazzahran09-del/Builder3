@@ -1,0 +1,238 @@
+name: Flutter APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_download_url:
+        description: 'URL download file ZIP Flutter project'
+        required: true
+        type: string
+      build_mode:
+        description: 'Build mode (release atau debug)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      run_id_ref:
+        description: 'Referensi unik untuk tracking'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.4'
+          channel: 'stable'
+          cache: true
+          cache-key: flutter-3.27.4-stable
+
+      - name: Setup Android SDK
+        run: |
+          ANDROID_SDK="/usr/local/lib/android/sdk"
+          echo "ANDROID_HOME=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "$ANDROID_SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK/platform-tools" >> $GITHUB_PATH
+
+      - name: Accept Android licenses
+        run: |
+          yes | sdkmanager --licenses 2>/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>/dev/null || true
+
+      - name: Download Flutter project ZIP
+        run: |
+          echo "Downloading ZIP..."
+          for i in 1 2 3; do
+            curl -fL --retry 3 --retry-delay 10 --max-time 600 \
+              -o project.zip "${{ github.event.inputs.zip_download_url }}" && break
+            echo "Attempt $i gagal, retry in 10s..."
+            sleep 10
+          done
+          du -sh project.zip
+
+      - name: Extract Flutter project
+        run: |
+          mkdir -p flutter_project
+          unzip -o project.zip -d flutter_project_raw
+          SUBDIR=$(find flutter_project_raw -maxdepth 3 -name "pubspec.yaml" | head -1 | xargs dirname 2>/dev/null)
+          if [ -n "$SUBDIR" ]; then
+            cp -r "$SUBDIR/." flutter_project/
+            echo "Project ditemukan di: $SUBDIR"
+          else
+            echo "ERROR: pubspec.yaml tidak ditemukan"
+            find flutter_project_raw -type f | head -20
+            exit 1
+          fi
+          echo "=== pubspec.yaml ==="
+          cat flutter_project/pubspec.yaml
+
+      # ── PATCH android/app/build.gradle ──────────────────────────────────
+      # Fix: minSdk, compileSdk, multiDex, hapus signing config yang rusak
+      - name: Patch android/app/build.gradle
+        run: |
+          GRADLE="flutter_project/android/app/build.gradle"
+          if [ ! -f "$GRADLE" ]; then
+            echo "build.gradle tidak ditemukan, skip patch"
+            exit 0
+          fi
+          echo "=== build.gradle SEBELUM patch ==="
+          cat "$GRADLE"
+
+          # Fix minSdkVersion → minimal 21
+          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 21/' "$GRADLE"
+          sed -i 's/minSdk [0-9]*/minSdk 21/' "$GRADLE"
+
+          # Fix compileSdkVersion → 34
+          sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/' "$GRADLE"
+          sed -i 's/compileSdk [0-9]*/compileSdk 34/' "$GRADLE"
+
+          # Fix targetSdkVersion → 34
+          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' "$GRADLE"
+          sed -i 's/targetSdk [0-9]*/targetSdk 34/' "$GRADLE"
+
+          # Tambah multiDexEnabled jika belum ada
+          grep -q "multiDexEnabled" "$GRADLE" || sed -i '/defaultConfig {/a\            multiDexEnabled true' "$GRADLE"
+
+          echo "=== build.gradle SETELAH patch ==="
+          cat "$GRADLE"
+
+      # ── PATCH: Hapus / nonaktifkan signing config release yang rusak ──────
+      # Kalau project pakai signingConfigs tapi .jks tidak ada → auto crash
+      - name: Fix signing config for release
+        run: |
+          GRADLE="flutter_project/android/app/build.gradle"
+          BUILD_MODE="${{ github.event.inputs.build_mode }}"
+
+          # Generate keystore debug sederhana untuk release jika tidak ada keystore
+          if grep -q "storeFile" "$GRADLE" 2>/dev/null; then
+            # Ada signing config — cek apakah .jks/.keystore ada
+            JKS=$(grep -o 'storeFile file("[^"]*")' "$GRADLE" | grep -o '"[^"]*"' | tr -d '"' | head -1)
+            FULL_JKS="flutter_project/android/app/$JKS"
+            if [ ! -f "$FULL_JKS" ] && [ ! -f "$JKS" ]; then
+              echo "Keystore '$JKS' tidak ditemukan, generate keystore otomatis..."
+              keytool -genkeypair -v \
+                -keystore flutter_project/android/app/release.jks \
+                -alias release \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass android -keypass android \
+                -dname "CN=FlutterBot,O=FlutterBot,C=ID" 2>/dev/null
+              # Patch gradle pakai keystore baru
+              sed -i 's|storeFile file("[^"]*")|storeFile file("release.jks")|g' "$GRADLE"
+              sed -i 's|storePassword "[^"]*"|storePassword "android"|g' "$GRADLE"
+              sed -i 's|keyAlias "[^"]*"|keyAlias "release"|g' "$GRADLE"
+              sed -i 's|keyPassword "[^"]*"|keyPassword "android"|g' "$GRADLE"
+              echo "Keystore otomatis di-generate: release.jks"
+            else
+              echo "Keystore ditemukan: $JKS"
+            fi
+          else
+            echo "Tidak ada custom signingConfig, aman untuk build"
+          fi
+
+      # ── local.properties & gradle.properties ────────────────────────────
+      - name: Write local.properties
+        run: |
+          FLUTTER_SDK=$(which flutter | sed 's|/bin/flutter||')
+          echo "sdk.dir=$ANDROID_HOME" > flutter_project/android/local.properties
+          echo "flutter.sdk=$FLUTTER_SDK" >> flutter_project/android/local.properties
+          echo "flutter.buildMode=${{ github.event.inputs.build_mode }}" >> flutter_project/android/local.properties
+          cat flutter_project/android/local.properties
+
+      - name: Write gradle.properties
+        run: |
+          GP="flutter_project/android/gradle.properties"
+          touch "$GP"
+          grep -q "org.gradle.jvmargs"    "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
+          grep -q "android.useAndroidX"   "$GP" || echo "android.useAndroidX=true"   >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+          grep -q "org.gradle.parallel"   "$GP" || echo "org.gradle.parallel=true"   >> "$GP"
+          grep -q "org.gradle.caching"    "$GP" || echo "org.gradle.caching=true"    >> "$GP"
+          cat "$GP"
+
+      - name: Cache Pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ hashFiles('flutter_project/pubspec.lock') }}
+          restore-keys: pub-
+
+      - name: Flutter pub get
+        working-directory: flutter_project
+        run: flutter pub get
+
+      # ── Analyze dulu sebelum build — tangkap Dart error lebih awal ───────
+      - name: Flutter analyze (non-fatal)
+        working-directory: flutter_project
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 || true
+
+      # ── BUILD UTAMA ───────────────────────────────────────────────────────
+      # --verbose supaya log Dart error kelihatan jelas di GitHub Actions
+      - name: Build APK (${{ github.event.inputs.build_mode }})
+        working-directory: flutter_project
+        timeout-minutes: 40
+        run: |
+          BUILD_MODE="${{ github.event.inputs.build_mode }}"
+          echo "=== BUILD START: $BUILD_MODE ==="
+
+          if [ "$BUILD_MODE" = "release" ]; then
+            flutter build apk --release \
+              --no-tree-shake-icons \
+              --verbose \
+              2>&1 | tee /tmp/flutter_build.log
+          else
+            flutter build apk --debug \
+              --no-tree-shake-icons \
+              --verbose \
+              2>&1 | tee /tmp/flutter_build.log
+          fi
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  BUILD GAGAL — log error lengkap:"
+            echo "════════════════════════════════════════"
+            # Tampilkan baris error Dart (lib/*.dart)
+            grep -E "(Error|error|Exception|FAILED|lib/)" /tmp/flutter_build.log | tail -50 || true
+            echo "────────────────────────────────────────"
+            echo "  50 baris terakhir log:"
+            echo "────────────────────────────────────────"
+            tail -50 /tmp/flutter_build.log
+            exit 1
+          fi
+
+      - name: Locate and rename APK
+        run: |
+          APK=$(find flutter_project/build/app/outputs -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            find flutter_project/build -type f 2>/dev/null | head -20
+            exit 1
+          fi
+          mkdir -p artifacts
+          cp "$APK" artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
+          echo "✅ APK siap: $(du -sh artifacts/*.apk)"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk-${{ github.event.inputs.build_mode }}-${{ github.run_id }}
+          path: artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
+          retention-days: 3
